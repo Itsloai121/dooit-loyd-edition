@@ -1,0 +1,969 @@
+--- a/.github/workflows/pytest.yml
++++ b/.github/workflows/pytest.yml
+@@ -1,12 +1,12 @@
+ name: Pytest Checks
+ on:
+   push:
+-    branches:
+-      - develop
+-  # pull_request:
+-  #   branches:
+-  #     - main
+-  #     - develop
++    branches: [main, develop]
++  pull_request:
++    branches: [main, develop]
++permissions:
++  contents: read
++
+ jobs:
+   test:
+     runs-on: ubuntu-latest
+@@ -20,6 +20,6 @@
+       - name: Set up Python ${{ matrix.python-version }}
+         run: uv python install ${{ matrix.python-version }}
+       - name: Install dependencies
+-        run: uv sync
++        run: uv sync --locked
+       - name: Run Tests
+-        run: uv run pytest
++        run: uv run --locked pytest
+--- a/.github/workflows/ruff.yml
++++ b/.github/workflows/ruff.yml
+@@ -2,12 +2,12 @@
+ 
+ on:
+   push:
+-    branches:
+-      - develop
+-  # pull_request:
+-  #   branches:
+-  #     - main
+-  #     - develop
++    branches: [main, develop]
++  pull_request:
++    branches: [main, develop]
++
++permissions:
++  contents: read
+ 
+ jobs:
+   lint:
+@@ -23,8 +23,7 @@
+           python-version: ${{ matrix.python-version }}
+       - name: Install dependencies
+         run: |
+-          python -m pip install --upgrade pip
+-          pip install ruff
++          python -m pip install ruff==0.13.1
+       - name: Lint Check
+         run: |
+           ruff check .
+--- a/.github/workflows/vitepress_deploy.yml
++++ b/.github/workflows/vitepress_deploy.yml
+@@ -34,7 +34,7 @@
+       - name: Install dependencies
+         run: |
+           cd site
+-          bun install 
++          bun install --frozen-lockfile 
+       - name: Build with VitePress
+         run: |
+           cd site
+--- /dev/null
++++ b/HARDENING_NOTES.md
+@@ -0,0 +1,227 @@
++# Dooit: problems, changes, and what still needs checking
++
++**Review date:** 10 October 2026  
++**Tool:** Dooit 3.3.4, from `dooit loyd edition.rar`  
++**Status:** Source-only review and candidate hardening patch. **Not runtime-verified.**
++
++## Read this first
++
++- The requested **DevSecOps Checklist (Expanded Edition).pdf was not attached** and was not found in the archive. This review cannot claim compliance with that checklist. Upload it for an exact requirement-by-requirement assessment.
++- I reviewed the attached code and made changes in a separate copy. Your original archive is unchanged.
++- Project execution was blocked by the environment safety check. Approval to install the project's locked dependencies and run its tests was requested but had not been received when these files were produced. No baseline test, unit test, integration test, live port scan or GitHub workflow was run.
++- The changed Python files were checked for syntax without importing/executing the application. This is useful, but does not prove the fixes work.
++- Use the patched copy as a **review/test candidate**, not as a production-certified release.
++
++## About the ports
++
++I found no direct TCP/UDP listener, socket creation, HTTP client or server call in the application's `dooit/` source. This is static evidence, not proof about a running installation. In particular, SQLAlchemy's `listen(...)` is an event hook, not a listening network port.
++
++The documentation project has development/preview commands that can start a local web server when someone explicitly runs them. The lockfile also includes development server packages; their presence alone does not mean the todo app opens ports.
++
++### What I changed
++
++- Added a hardcoded Python audit-hook policy that rejects IPv4/IPv6 socket creation, IP bind/connect operations and DNS lookups on normal CLI/TUI startup. There is no configuration or environment toggle to turn it off.
++- Disabled automatic external Python config execution during startup, and rejected external config paths through the CLI and TUI constructor.
++- Disabled the app's external-URL-opening action.
++- Made the bundled documentation `docs:dev` and `docs:preview` scripts exit with an error instead of starting a server. Static documentation builds are still available.
++
++### What this does NOT mean
++
++I did **not** close existing ports on your computer, change a firewall, stop other programs, or scan a live machine. The guard applies to ordinary Python socket APIs in the Dooit process after installation; it is **not an OS sandbox**. Native code, child processes, code editing the guard, direct library-only use, external tools and servers launched outside the patched commands are not covered. Unix-domain sockets remain allowed for local event-loop support. The process-wide policy may affect other code if Dooit is embedded in the same interpreter.
++
++For a stronger deployment guarantee, an administrator must separately apply and verify OS-level network isolation and prevent unnecessary listeners. Do not blindly block all ports on a remote host: that can disconnect administration or break unrelated services.
++
++## Problems and how the source was changed
++
++### F01 - Migration can erase or partially replace existing todos
++
++**Priority:** High  
++**Where:** `dooit/backport/migrate_from_v2.py:11, 75-93, 97-141; dooit/utils/database.py:5-10; dooit/api/manager.py:53-58` (original archive line numbers)
++
++**What was wrong:** Migration opens a database at import time, commits deletion before reading and converting all legacy data, and saves each item in separate commits. A malformed later record can leave the old rows erased and only some new rows saved. The old YAML backup uses a fixed .bak name that can collide with an earlier backup.
++
++**Why it matters:** User data loss during an explicitly confirmed migration. This is a local data-integrity risk, not remote exploitation.
++
++**What I changed / how to fix it:** Removed the import-time connection. Migration now reads the top-level YAML first, creates unique owner-only legacy and SQLite backups before row replacement, and wraps delete/save operations in one Manager.transaction(). Failed conversions roll back row changes. Legacy cleanup happens only after commit and reports cleanup failures separately.
++
++**What is verified:** Source patch supplied; runtime migration and restore tests pending.
++
++**What is still left:** Schema/file creation is not rolled back with row changes. A failed first migration can leave an empty database file. Full nested schema validation, YAML size/depth limits, concurrent-writer handling and backup-restore exercises are still needed.
++
++### F02 - Stylesheet identifiers can escape the cache directory
++
++**Priority:** Medium  
++**Where:** `dooit/utils/css_manager.py:73-94` (original archive line numbers)
++
++**What was wrong:** Caller-provided stylesheet IDs are joined directly into file paths. An ID such as ../escape can target a .tcss file outside the intended stylesheets directory. The same problem affects deletion. Existing symlinks can also redirect writes.
++
++**Why it matters:** A local caller or trusted Python extension can overwrite/delete reachable .tcss files. No remote or unauthenticated path to this API was found.
++
++**What I changed / how to fix it:** All ID-based operations now use one validator allowing only 1-128 letters, digits, underscores or hyphens. Final-component symlinks are rejected. New injections use exclusive creation and O_NOFOLLOW where available. Reads accept only regular .tcss files.
++
++**What is verified:** Source patch supplied; traversal/symlink regression tests added, not run.
++
++**What is still left:** Duplicate stylesheet IDs now fail rather than overwrite. The shared cache design and main dooit.tcss write path were not fully redesigned; same-user filesystem races and concurrent app instances remain outside the fix.
++
++### F03 - User configuration is executable Python
++
++**Priority:** High / conditional  
++**Where:** `dooit/ui/api/plug.py:40-45; dooit/ui/api/loader.py:28-40; dooit/__main__.py:11-20` (original archive line numbers)
++
++**What was wrong:** Startup automatically imports the user config.py and executes its top-level code. Explicit --config does the same. This is an intended extension feature, but unsafe if a user runs a downloaded config or another actor can modify the config file.
++
++**Why it matters:** An untrusted configuration can act with the user's permissions, including reading files or launching child processes. Severity depends on the trust of the config; the application is not a network service.
++
++**What I changed / how to fix it:** The hardened startup scans only the bundled defaults. CLI and direct TUI construction reject external config paths. Automatic external URL opening is also disabled for the offline edition.
++
++**What is verified:** Hardening source patch supplied; startup behavior test pending.
++
++**What is still left:** This intentionally removes custom config/plugin convenience from normal startup. The internal loader API is still executable code and must remain trusted. This is not a sandbox for malicious Python or native extensions.
++
++### F04 - Database privacy depends on the process umask
++
++**Priority:** Medium  
++**Where:** `dooit/api/_vars.py:4-8; dooit/api/manager.py:23-29` (original archive line numbers)
++
++**What was wrong:** Default directories and SQLite files are created without explicit owner-only modes. With a typical 022 umask, the data directory/file may be readable by other local users when parent-directory access permits. Symlink database paths are not rejected.
++
++**Why it matters:** Potential disclosure of plaintext todo contents to other users on the same computer. Actual exposure depends on deployment permissions; no user database was supplied.
++
++**What I changed / how to fix it:** Added private storage helpers. The application-owned data directory is 0700 on POSIX; database files are precreated/tightened to 0600. Ownership, parent write permissions, regular-file type and final symlinks are checked. SQLite URLs are constructed with URL.create instead of string interpolation.
++
++**What is verified:** Source patch supplied; POSIX permission/symlink tests added, not run.
++
++**What is still left:** Windows ACLs and encrypted storage are not implemented. These checks do not replace an OS sandbox. Parent/ancestor trust, SQLite sidecar behavior and migration backup permissions need deployment verification. Existing default-directory permissions will be tightened.
++
++### F05 - Configuration loader changes the global import search path
++
++**Priority:** Medium  
++**Where:** `dooit/ui/api/loader.py:18-25, 32-36` (original archive line numbers)
++
++**What was wrong:** register() appends a config directory before entering the temporary context. The context removes a matching path even when that entry existed before the call. Exceptions and duplicate entries can leave or remove unexpected entries in global sys.path.
++
++**Why it matters:** Import resolution can change after loading config; nearby modules may shadow expected imports. This is an import-integrity and reliability issue, conditional on trusted config use.
++
++**What I changed / how to fix it:** Removed the extra append. The context snapshots sys.path and restores the same list contents in finally, including when a loaded module raises an exception.
++
++**What is verified:** Source patch supplied; normal/exception restoration test added, not run.
++
++**What is still left:** sys.path is process-global. Concurrent module loading is not synchronized; external Python execution remains trusted-only and is disabled in normal hardened startup.
++
++### F06 - Inserting an item shifts unrelated sibling groups
++
++**Priority:** Medium  
++**Where:** `dooit/api/hooks/fix_hooks.py:15-24, 33-42` (original archive line numbers)
++
++**What was wrong:** Both insertion hooks update every row whose order_index is high enough, without restricting the update to the inserted item's parent. Adding an item under workspace A can change ordering values under workspace B.
++
++**Why it matters:** Cross-workspace ordering corruption. This is a business-logic/data-integrity bug, not SQL injection; the original values are parameterized.
++
++**What I changed / how to fix it:** Workspace updates now filter by parent_workspace_id. Todo updates filter by both parent_workspace_id and parent_todo_id using null-safe SQLite IS comparisons. Updates remain parameterized.
++
++**What is verified:** Source patch supplied; cross-parent ordering tests added, not run.
++
++**What is still left:** Concurrent insertion and nested-copy ordering have not been stress-tested. SQLAlchemy relationship/FK timing must be confirmed by the regression suite.
++
++### F07 - Input and fallback handling has reliability edge cases
++
++**Priority:** Low  
++**Where:** `dooit/utils/date_parser.py:6-10; dooit/utils/css_manager.py:65-69; dooit/api/manager.py:41-46` (original archive line numbers)
++
++**What was wrong:** Date parsing catches only ParserError, so overflow errors can escape. Unknown theme names store a class instead of an instance. Manager.has_changed() expires the global manager session rather than the current instance.
++
++**Why it matters:** Malformed large dates can interrupt UI processing. Inconsistent fallback types and the wrong session target can break integrations or independent Manager instances.
++
++**What I changed / how to fix it:** Date parsing catches ValueError and OverflowError and returns an invalid-input result. The theme fallback uses a DooitThemeBase instance. Database change detection now expires self.session.
++
++**What is verified:** Source patch supplied; date regression test added, not run.
++
++**What is still left:** These are targeted edge-case fixes, not an exhaustive UI or parser correctness review. Additional timezone, recurrence and multi-instance tests are recommended.
++
++### F08 - Test/lint CI does not gate pull requests or main
++
++**Priority:** Medium  
++**Where:** `.github/workflows/pytest.yml:3-10, 22-26; .github/workflows/ruff.yml:4-11, 26-29; .github/workflows/vitepress_deploy.yml:38-41` (original archive line numbers)
++
++**What was wrong:** Test and lint workflows run only for pushes to develop; pull_request triggers are commented out. Dependency setup is not explicitly lock-enforcing, and Ruff is installed without a version. Docs build uses bun install without frozen-lock enforcement.
++
++**Why it matters:** Changes can reach main without repository-defined test/lint checks. Builds may drift from the checked-in dependency resolutions.
++
++**What I changed / how to fix it:** Enabled main/develop push and pull-request triggers with read-only token permissions for test/lint workflows. Tests use uv sync/run --locked; Ruff is pinned to the existing lock version 0.13.1; docs installs use --frozen-lockfile.
++
++**What is verified:** Workflow source updated; no GitHub jobs executed and no branch rules changed.
++
++**What is still left:** Require these checks through repository branch protection/rulesets. GitHub permissions and actual job behavior must be verified. The binary release pipeline remains separate and unremediated.
++
++### F09 - Release dependencies and workflow actions are mutable
++
++**Priority:** Medium  
++**Where:** `.github/workflows/app.yml:18-35, 59-68; .github/workflows/python-publish.yml:21-37; .github/workflows/vitepress_deploy.yml:21-34; pyproject.toml:17-41` (original archive line numbers)
++
++**What was wrong:** Release packaging installs a Git repository without a commit pin and resolves packages from ranges. Most action references use mutable version tags rather than full commit SHAs. Publishing uses a long-lived secret token. Test/lock checks are not release prerequisites.
++
++**Why it matters:** A changed upstream dependency or action can alter a release without changes to this repository. Exposure is a supply-chain possibility, not proof of compromise or a confirmed dependency CVE.
++
++**What I changed / how to fix it:** No unverified action SHA or upstream commit was invented. This finding is intentionally left open. Verify and pin action SHAs and the extras commit, use locked release dependency inputs, enforce protected release gates, and evaluate PyPI trusted publishing with a protected environment.
++
++**What is verified:** OPEN - owner-approved supply-chain changes required.
++
++**What is still left:** No live vulnerability database scan, PyPI audit, npm/Bun audit, full Git-history secret scan, SBOM generation, signing or provenance validation was completed. Existing lock hashes do not establish absence of vulnerabilities.
++
++## Important behavior changes
++
++1. **Custom Python configs no longer run automatically.** Existing custom themes, key bindings and extensions configured this way will not load. The bundled defaults remain.
++2. **No normal Python IP networking.** Network-dependent extensions will fail with PermissionError. This is deliberate, but untested here.
++3. **Safer stylesheet IDs.** Only letters, numbers, `_` and `-` are allowed; length is 1-128. A duplicate ID no longer overwrites the old stylesheet.
++4. **Private storage.** On POSIX systems, the app-owned default data directory is tightened to 0700 and DB files to 0600. Custom DB parent directories must be owned by the current user and not writable by other users. Windows needs ACL checks.
++5. **Migration backups are unique.** Backup files include a random suffix. Keep them until a successful restore exercise confirms your data is safe. If migration fails, a new empty DB file may remain; row rollback is not file/schema rollback.
++6. **Docs servers are disabled through package scripts.** Documentation builds still work; manually launching VitePress outside these scripts is not blocked.
++
++## How to verify before using the changes
++
++These are proposed checks, not successful results from this review.
++
++1. Extract `dooit-hardened-source.zip` into a new folder. Do not overwrite your only copy.
++2. Back up your real Dooit database, old YAML and configuration. Test only against disposable copies first.
++3. Install a trusted `uv` tool and use the lockfile:
++
++```sh
++uv sync --locked
++uv run --locked pytest
++uv run --locked pytest tests/security/test_hardening.py -q
++uv run --locked ruff check .
++uv run --locked ruff format --check .
++```
++
++4. If format-only checks fail, format the candidate in a reviewed branch, inspect the diff, and rerun the checks. No formatter or runtime test was run here.
++5. Check normal startup, creating/editing/deleting todos, search, sorting and clipboard support. Use a temporary HOME/XDG config/data/cache environment so real data is untouched.
++6. Exercise valid migration, malformed later records, declined overwrite, backup failure, duplicate backup names, and post-commit cleanup failure. Confirm rollback preserves old rows. Restore from both YAML and SQLite backups.
++7. Verify the Python guard denies IPv4/IPv6 TCP and UDP sockets and DNS, and verify the actual Dooit process owns no TCP/UDP listeners with your OS tools. Also check spawned processes separately. Do not treat static search as a port scan.
++8. Run CI in GitHub. Require the test/lint jobs in branch rules. Review and pin release actions/dependencies with the repository owner.
++9. Scan resolved runtime and development dependencies against a current vulnerability database. Review the docs dependency graph separately. Review complete Git history for secrets; rotate any real secret found rather than just deleting it.
++10. Upload the missing checklist so every original control can be mapped to evidence, status and remaining work.
++
++## Checklist status
++
++Because the checklist PDF is missing, the categories below are only a provisional index, not a checklist score:
++
++- Code/input safety: targeted patches supplied; runtime verification pending.
++- Data privacy: POSIX mode hardening supplied; Windows ACLs/encryption unassessed.
++- Backup/recovery: migration source patched; restore testing pending.
++- Network exposure: no core listener calls found statically; Python guard added; live/OS checks pending.
++- CI quality gates: workflow edits supplied; hosted jobs and branch rules unverified.
++- Supply chain: open release-chain issues; CVE audit, SBOM and provenance not completed.
++- Secrets: targeted patterns found no match in the reviewed current files outside `.git`; this is not a complete secret scan or proof that no secrets exist.
++- Deployment/IAM/monitoring/incident response: no live deployment, account or operational evidence supplied; not assessed.
++
++## Files and evidence
++
++- `dooit-security-audit.pdf`: designed technical report.
++- `dooit-findings-and-fixes.md`: this plain-language explanation.
++- `dooit-hardened-source.zip`: candidate modified source, existing tests and new unrun security regression tests; excludes Git history and environment files. Preserves the original license.
++- `dooit-hardening.patch`: unified diff for reviewing/applying the code changes against the original working tree.
++- `audit-manifest.json`: original archive hash, changed files, source hashes and validation limits.
++
++**Source integrity:** Original archive SHA-256: `3d4d177ec4f82ca500937e52c8f215e4dbebd3f6732338715c4146783ab2c8ec`.
++
++No runtime pass count or full compliance result is claimed. Original source line references identify the evidence reviewed; line numbers shift in the patched copy.
+--- a/dooit/__main__.py
++++ b/dooit/__main__.py
+@@ -9,7 +9,12 @@
+ 
+ 
+ def run_dooit(config: Optional[str] = None, db_path: Optional[str] = None):
+-    config_path = None if not config else Path(config)
++    from dooit.utils.network_policy import install_network_policy
++
++    install_network_policy()
++    if config:
++        raise click.ClickException("External Python config is disabled in the hardened edition")
++    config_path = None
+ 
+     if config_path and not (config_path.exists() and config_path.is_file()):
+         print(f"Config file {config} not found.")
+@@ -34,6 +39,9 @@
+ @click.option("--db", default=None, help="Path to database file")
+ @click.pass_context
+ def main(ctx, version: bool, config: str, db: str) -> None:
++    from dooit.utils.network_policy import install_network_policy
++
++    install_network_policy()
+     if version:
+         return print(f"dooit - {VERSION}")
+ 
+--- a/dooit/api/_vars.py
++++ b/dooit/api/_vars.py
+@@ -5,4 +5,6 @@
+ DATABASE_FILE = ROOT_FOLDER / "dooit.db"
+ DATABASE_CONN_STRING = f"sqlite:///{DATABASE_FILE}"
+ 
+-DATABASE_FILE.parent.mkdir(parents=True, exist_ok=True)
++from dooit.utils.private_files import private_directory
++
++private_directory(DATABASE_FILE.parent)
+--- a/dooit/api/hooks/fix_hooks.py
++++ b/dooit/api/hooks/fix_hooks.py
+@@ -18,8 +18,9 @@
+             UPDATE workspace
+             SET order_index = order_index + 1
+             WHERE order_index >= :current_index
++              AND parent_workspace_id IS :parent_workspace_id
+             """),
+-            {"current_index": target.order_index, "target_id": target.id},
++            {"current_index": target.order_index, "parent_workspace_id": target.parent_workspace_id},
+         )
+ 
+ 
+@@ -34,6 +35,8 @@
+             UPDATE todo
+             SET order_index = order_index + 1
+             WHERE order_index >= :current_index
++              AND parent_workspace_id IS :parent_workspace_id
++              AND parent_todo_id IS :parent_todo_id
+             """),
+-            {"current_index": target.order_index, "target_id": target.id},
++            {"current_index": target.order_index, "parent_workspace_id": target.parent_workspace_id, "parent_todo_id": target.parent_todo_id},
+         )
+--- a/dooit/api/manager.py
++++ b/dooit/api/manager.py
+@@ -1,6 +1,8 @@
+ import os
++from pathlib import Path
++from contextlib import contextmanager
+ from typing import Optional
+-from sqlalchemy import create_engine
++from sqlalchemy import create_engine, URL
+ from sqlalchemy.orm import Session
+ from ._vars import DATABASE_FILE
+ 
+@@ -22,8 +24,17 @@
+ 
+         path = path or DATABASE_FILE
+         path = os.path.expanduser(path)
+-        connection_string = f"sqlite:///{path}"
+-        self.engine = create_engine(connection_string)
++        if path != ":memory:":
++            from dooit.utils.private_files import private_file
++
++            path = str(Path(path).absolute())
++            private_file(Path(path))
++        connection_url = URL.create("sqlite", database=path)
++        if hasattr(self, "session"):
++            self.session.close()
++            self.engine.dispose()
++        self._transaction_depth = 0
++        self.engine = create_engine(connection_url)
+         self.session = Session(self.engine)
+ 
+         BaseModel.metadata.create_all(bind=self.engine)
+@@ -42,7 +53,7 @@
+         current_last_modified = self._get_db_last_modified()
+         if current_last_modified and self._db_last_modified != current_last_modified:
+             self._db_last_modified = current_last_modified
+-            manager.session.expire_all()
++            self.session.expire_all()
+             return True
+         return False
+ 
+@@ -55,8 +66,30 @@
+         self.commit()
+ 
+     def commit(self):
+-        self.session.commit()
+-        self._db_last_modified = self._get_db_last_modified()
++        if self._transaction_depth:
++            self.session.flush()
++        else:
++            try:
++                self.session.commit()
++            except Exception:
++                self.session.rollback()
++                raise
++            self._db_last_modified = self._get_db_last_modified()
++
++    @contextmanager
++    def transaction(self):
++        if self._transaction_depth:
++            raise RuntimeError("Nested migration transactions are not supported")
++        self._transaction_depth = 1
++        try:
++            yield
++            self.session.commit()
++            self._db_last_modified = self._get_db_last_modified()
++        except Exception:
++            self.session.rollback()
++            raise
++        finally:
++            self._transaction_depth = 0
+ 
+ 
+ manager = Manager()
+--- a/dooit/backport/migrate_from_v2.py
++++ b/dooit/backport/migrate_from_v2.py
+@@ -1,4 +1,7 @@
+ import re
++import os
++import sqlite3
++from uuid import uuid4
+ from datetime import datetime, timedelta
+ from typing import List, Optional, Tuple
+ from yaml import safe_load
+@@ -8,7 +11,6 @@
+ from dooit.utils.cli_logger import logger
+ from dooit.utils.database import delete_all_data
+ 
+-manager.connect()
+ BASE_PATH = Path(user_data_dir("dooit"))
+ operations = []
+ 
+@@ -25,7 +27,7 @@
+         if re.match(r"^(\d+)[mhdw]$", duration):
+             return duration[-1], duration[:-1]
+         else:
+-            return tuple()
++            raise ValueError("Invalid recurrence format")
+ 
+     sign, frequency = split_duration(recurrence)
+     frequency = int(frequency)
+@@ -56,41 +58,70 @@
+             return safe_load(f)
+ 
+     def backup_old_config(self):
+-        logger.info("Moving old config to a backup file ...")
++        backup_location = self.old_location.with_name(self.old_location.name + "." + uuid4().hex + ".bak")
++        fd = os.open(backup_location, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
++        with os.fdopen(fd, "wb") as backup:
++            backup.write(self.old_location.read_bytes())
++        logger.success(f"Legacy backup created: {backup_location}")
++        return backup_location
+ 
+-        backup_location = self.old_location.with_suffix(".bak")
+-        self.old_location.rename(backup_location)
++    def backup_database(self):
++        backup_location = self.new_location.with_name(self.new_location.name + "." + uuid4().hex + ".bak")
++        from dooit.utils.private_files import private_file
+ 
+-        logger.success("Backup successful")
++        private_file(backup_location)
++        try:
++            with sqlite3.connect(str(self.new_location)) as source:
++                with sqlite3.connect(str(backup_location)) as target:
++                    source.backup(target)
++        except Exception:
++            backup_location.unlink(missing_ok=True)
++            raise
++        logger.success(f"Database backup created: {backup_location}")
++        return backup_location
+ 
+     def migrate(self):
+-        logger.info("Checking for old data ...")
+-
+         if not self.check_for_old_data():
+             logger.error("No old data found")
+-            return
++            return False
+ 
+-        logger.info("Found old data. Converting ...")
++        existed = self.new_location.exists()
++        try:
++            # Read and validate the top-level container before touching destination rows.
++            data = self.load_old()
++            if not isinstance(data, list):
++                raise ValueError("Legacy data must be a list of workspaces")
++            if existed:
++                confirm = logger.console.input(
++                    "Database already exists. Back it up and replace its data? (y/n): "
++                )
++                if confirm.lower() != "y":
++                    logger.error("Migration aborted")
++                    return False
++            self.backup_old_config()
++            if existed:
++                # Check the destination without following final-component symlinks.
++                from dooit.utils.private_files import private_file
+ 
++                private_file(self.new_location)
++                self.backup_database()
++            manager.connect(str(self.new_location))
++            with manager.transaction():
++                if existed:
++                    delete_all_data(manager.session, commit=False)
++                for workspace in data:
++                    self.create_workspace(workspace)
++        except Exception as e:
++            logger.error(f"Migration failed; row changes rolled back: {e}")
++            return False
++
++        # Cleanup is separate from commit: a cleanup failure must not imply rollback.
+         try:
+-            if self.new_location.exists():
+-                confirm = logger.console.input(
+-                    "Database already exists. Do you want to overwrite it? (y/n): "
+-                )
+-                if confirm.lower() == "y":
+-                    delete_all_data(manager.session)
+-                else:
+-                    logger.error("Migration aborted")
+-                    return
+-
+-            data = self.load_old()
+-            for workspace in data:
+-                self.create_workspace(workspace)
+-
+-            self.backup_old_config()
+-            logger.success("Successfully moved to new version. Happy todoing!")
+-        except Exception as e:
+-            logger.error(f"Error converting data: {e}")
++            self.old_location.unlink()
++        except OSError as e:
++            logger.warn(f"Migration committed, but legacy file cleanup failed: {e}")
++        logger.success("Migration committed. Backups retained.")
++        return True
+ 
+     # ------------------------------------------------
+ 
+--- a/dooit/ui/api/loader.py
++++ b/dooit/ui/api/loader.py
+@@ -15,14 +15,14 @@
+     # Temporarily add the parent directory to the path
+     # to allow imports from other files in the same directory
+ 
++    original_path = sys.path[:]
+     parent_path = str(path.parent.absolute())
+     if parent_path not in sys.path:
+         sys.path.insert(0, parent_path)
+     try:
+         yield
+     finally:
+-        if parent_path in sys.path:
+-            sys.path.remove(parent_path)
++        sys.path[:] = original_path
+ 
+ 
+ def register(api: "PluginManager", path: Path) -> None:
+@@ -30,9 +30,6 @@
+     spec = importlib.util.spec_from_file_location(module_name, path)
+ 
+     if spec and spec.loader:
+-        parent_path = str(path.parent.absolute())
+-        sys.path.append(parent_path)
+-
+         with temporary_sys_path(path):
+             module = importlib.util.module_from_spec(spec)
+             spec.loader.exec_module(module)
+--- a/dooit/ui/api/plug.py
++++ b/dooit/ui/api/plug.py
+@@ -39,10 +39,8 @@
+ 
+     def scan(self):
+         load_file(self, DEFAULT_CONFIG)
+-        if is_running_under_pytest():
+-            return
+-
+-        load_file(self, self.config)
++        # Hardened edition: only execute the bundled, reviewed defaults.
++        # External Python configuration is executable code, not passive data.
+ 
+     def _update_dooit_value(self, obj, *params):
+         res = obj(self.api, *params)
+--- a/dooit/ui/tui.py
++++ b/dooit/ui/tui.py
+@@ -39,7 +39,12 @@
+         db_path: Optional[str] = None,
+         config: Optional[Path] = None,
+     ):
+-        super().__init__(watch_css=True)
++        from dooit.utils.network_policy import install_network_policy
++
++        install_network_policy()
++        if config is not None:
++            raise ValueError("External Python config is disabled in the hardened edition")
++        super().__init__(watch_css=False)
+         self.dooit_mode: ModeType = "NORMAL"
+         self.config = config
+         manager.connect(db_path)
+@@ -110,7 +115,7 @@
+         await self.action_quit()
+ 
+     async def action_open_url(self, url: str) -> None:  # pragma: no cover
+-        self.open_url(url)
++        raise PermissionError("Opening external URLs is disabled in the offline edition")
+ 
+ 
+ if __name__ == "__main__":  # pragma: no cover
+--- a/dooit/utils/css_manager.py
++++ b/dooit/utils/css_manager.py
+@@ -1,4 +1,6 @@
+ import sys
++import os
++import re
+ from pathlib import Path
+ from typing import Optional, Type, Union
+ from platformdirs import user_cache_dir
+@@ -52,8 +54,10 @@
+ 
+         # inject extra stylesheets
+         self.stylesheets.mkdir(parents=True, exist_ok=True)
+-        for sheet in self.stylesheets.iterdir():
+-            with open(sheet, "r") as f:
++        for sheet in sorted(self.stylesheets.glob("*.tcss")):
++            if sheet.is_symlink() or not sheet.is_file():
++                raise ValueError("Only regular stylesheet files are allowed")
++            with open(sheet, "r", encoding="utf-8") as f:
+                 css = css + "\n" + f.read()
+ 
+         self.write(css)
+@@ -64,24 +68,33 @@
+ 
+     def set_theme(self, theme: Union[str, Type[DooitThemeBase]]):
+         if isinstance(theme, str):
+-            self.theme = self.themes.get(theme, DooitThemeBase)
++            self.theme = self.themes.get(theme, DooitThemeBase())
+         else:
+             self.theme = theme()
+ 
+         self.refresh_css()
+ 
++    def _stylesheet_path(self, identifier: str) -> Path:
++        if not isinstance(identifier, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", identifier):
++            raise ValueError("Stylesheet ID must contain only letters, digits, underscores or hyphens")
++        candidate = self.stylesheets / f"{identifier}.tcss"
++        if candidate.is_symlink():
++            raise ValueError("Symlink stylesheets are not allowed")
++        return candidate
++
+     def inject_css(self, css: str, _id: Optional[str] = None) -> str:
+         uuid = _id or generate_random_id()
+-        css_file = self.stylesheets / f"{uuid}.tcss"
+-
+-        with open(css_file, "w") as f:
++        css_file = self._stylesheet_path(uuid)
++        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
++        fd = os.open(css_file, flags, 0o600)
++        with os.fdopen(fd, "w", encoding="utf-8") as f:
+             f.write(css)
+ 
+         self.refresh_css()
+         return uuid
+ 
+     def unject_css(self, _id: str) -> bool:
+-        css_file = self.stylesheets / f"{_id}.tcss"
++        css_file = self._stylesheet_path(_id)
+ 
+         if not css_file.exists():
+             return False
+@@ -91,7 +104,7 @@
+         return True
+ 
+     def is_active(self, _id: str) -> bool:
+-        return (self.stylesheets / f"{_id}.tcss").exists()
++        return self._stylesheet_path(_id).is_file()
+ 
+     def write(self, css: str):
+         with open(self.css_file, "w") as f:
+--- a/dooit/utils/database.py
++++ b/dooit/utils/database.py
+@@ -2,9 +2,10 @@
+ from sqlalchemy.orm import Session
+ 
+ 
+-def delete_all_data(session: Session):
++def delete_all_data(session: Session, commit: bool = True):
+     meta = MetaData()
+     meta.reflect(bind=session.get_bind())
+     for table in reversed(meta.sorted_tables):
+         session.execute(table.delete())
+-    session.commit()
++    if commit:
++        session.commit()
+--- a/dooit/utils/date_parser.py
++++ b/dooit/utils/date_parser.py
+@@ -6,5 +6,5 @@
+ def parse(value: str) -> Tuple[Optional[datetime], bool]:
+     try:
+         return parser.parse(value), True
+-    except parser.ParserError:
++    except (ValueError, OverflowError):
+         return None, False
+--- /dev/null
++++ b/dooit/utils/network_policy.py
+@@ -0,0 +1,28 @@
++"""Hardcoded Python IP-network deny policy. Not an OS security sandbox."""
++import socket
++import sys
++
++_installed = False
++_IP_FAMILIES = {socket.AF_INET, socket.AF_INET6}
++_DNS_EVENTS = {
++    "socket.getaddrinfo", "socket.gethostbyname", "socket.gethostbyaddr",
++    "socket.getnameinfo",
++}
++
++
++def _deny_ip_network(event, args):
++    if event == "socket.__new__" and args[1] in _IP_FAMILIES:
++        raise PermissionError("Dooit offline edition: IPv4/IPv6 sockets are disabled")
++    if event in {"socket.bind", "socket.connect"}:
++        if args[0].family in _IP_FAMILIES:
++            raise PermissionError("Dooit offline edition: IP networking is disabled")
++    if event in _DNS_EVENTS:
++        raise PermissionError("Dooit offline edition: DNS lookups are disabled")
++
++
++def install_network_policy():
++    """Install once, with no CLI switch or environment-variable override."""
++    global _installed
++    if not _installed:
++        sys.addaudithook(_deny_ip_network)
++        _installed = True
+--- /dev/null
++++ b/dooit/utils/private_files.py
+@@ -0,0 +1,38 @@
++"""Owner-only POSIX storage helpers; Windows ACLs require deployment controls."""
++import os
++import stat
++from pathlib import Path
++
++
++def private_directory(path: Path):
++    path.mkdir(mode=0o700, parents=True, exist_ok=True)
++    if path.is_symlink() or not path.is_dir():
++        raise ValueError("Storage directory must be a real directory")
++    if os.name == "posix":
++        info = path.stat()
++        if info.st_uid != os.getuid():
++            raise PermissionError("Storage directory is not owned by the current user")
++        path.chmod(0o700)
++
++
++def private_file(path: Path):
++    # A trusted parent prevents another local user replacing the file after checks.
++    if not path.parent.is_dir() or path.parent.is_symlink():
++        raise ValueError("Database parent must be an existing real directory")
++    if os.name == "posix":
++        info = path.parent.stat()
++        if info.st_uid != os.getuid() or info.st_mode & 0o022:
++            raise PermissionError("Database parent must be owned by you and not writable by others")
++    if path.is_symlink():
++        raise ValueError("Symlink database files are not allowed")
++    fd = os.open(path, os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0), 0o600)
++    try:
++        info = os.fstat(fd)
++        if not stat.S_ISREG(info.st_mode):
++            raise ValueError("Database must be a regular file")
++        if os.name == "posix":
++            if info.st_uid != os.getuid():
++                raise PermissionError("Database is not owned by the current user")
++            os.fchmod(fd, 0o600)
++    finally:
++        os.close(fd)
+--- a/site/package.json
++++ b/site/package.json
+@@ -5,8 +5,8 @@
+     "vitepress-theme-tui": "^0.0.13"
+   },
+   "scripts": {
+-    "docs:dev": "vitepress dev docs",
++    "docs:dev": "node -e \"console.error('Disabled: offline hardened edition does not start documentation servers');process.exit(1)\"",
+     "docs:build": "vitepress build docs",
+-    "docs:preview": "vitepress preview docs"
++    "docs:preview": "node -e \"console.error('Disabled: offline hardened edition does not start documentation servers');process.exit(1)\""
+   }
+ }
+--- /dev/null
++++ b/tests/security/test_hardening.py
+@@ -0,0 +1,159 @@
++"""Regression tests supplied with the patch; NOT RUN during this source-only review."""
++import os
++import socket
++import subprocess
++import sys
++from pathlib import Path
++from types import SimpleNamespace
++from unittest.mock import patch
++
++import pytest
++from dooit.api import Workspace, manager
++from dooit.ui.api.loader import temporary_sys_path
++from dooit.utils.css_manager import CssManager
++from dooit.utils.date_parser import parse
++from dooit.utils.private_files import private_file
++
++
++@pytest.mark.parametrize("identifier", ["../escape", "/absolute", r"..\escape", "", "a/b", "a" * 129])
++def test_css_id_cannot_escape(tmp_path, identifier):
++    css = CssManager(cache_path=tmp_path)
++    with pytest.raises(ValueError):
++        css.inject_css("x {}", identifier)
++    with pytest.raises(ValueError):
++        css.unject_css(identifier)
++    with pytest.raises(ValueError):
++        css.is_active(identifier)
++
++
++def test_css_symlink_rejected(tmp_path):
++    if os.name != "posix":
++        pytest.skip("POSIX symlink test")
++    css = CssManager(cache_path=tmp_path)
++    outside = tmp_path / "outside.txt"
++    outside.write_text("unchanged")
++    (css.stylesheets / "linked.tcss").symlink_to(outside)
++    with pytest.raises(ValueError):
++        css.inject_css("overwrite", "linked")
++    assert outside.read_text() == "unchanged"
++
++
++def test_temporary_sys_path_restores_existing_entry(tmp_path):
++    original = sys.path[:]
++    parent = str(tmp_path.absolute())
++    sys.path.append(parent)
++    expected = sys.path[:]
++    try:
++        with temporary_sys_path(tmp_path / "config.py"):
++            pass
++        assert sys.path == expected
++        with pytest.raises(RuntimeError):
++            with temporary_sys_path(tmp_path / "config.py"):
++                raise RuntimeError("test")
++        assert sys.path == expected
++    finally:
++        sys.path[:] = original
++
++
++@pytest.mark.parametrize("family,kind", [(socket.AF_INET, socket.SOCK_STREAM), (socket.AF_INET, socket.SOCK_DGRAM), (socket.AF_INET6, socket.SOCK_STREAM), (socket.AF_INET6, socket.SOCK_DGRAM)])
++def test_python_ip_sockets_denied(family, kind):
++    code = f'''from dooit.utils.network_policy import install_network_policy
++import socket
++install_network_policy()
++try:
++    socket.socket({int(family)}, {int(kind)})
++except PermissionError:
++    print("DENIED")
++else:
++    raise SystemExit("network policy failed")
++'''
++    result = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True)
++    assert result.returncode == 0, result.stderr
++    assert "DENIED" in result.stdout
++
++
++def test_dns_denied():
++    code = '''from dooit.utils.network_policy import install_network_policy
++import socket
++install_network_policy()
++try:
++    socket.getaddrinfo("localhost", 80)
++except PermissionError:
++    print("DENIED")
++else:
++    raise SystemExit("DNS policy failed")
++'''
++    result = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True)
++    assert result.returncode == 0, result.stderr
++
++
++def test_config_scan_uses_only_defaults():
++    from dooit.ui.api import plug
++    plugin = plug.PluginManager(SimpleNamespace(app=None), config=Path("untrusted.py"))
++    with patch.object(plug, "load_file") as load:
++        plugin.scan()
++    load.assert_called_once_with(plugin, plug.DEFAULT_CONFIG)
++
++
++def test_private_database_mode_and_symlink(tmp_path):
++    if os.name != "posix":
++        pytest.skip("Windows requires ACL verification")
++    path = tmp_path / "data.db"
++    private_file(path)
++    assert path.stat().st_mode & 0o777 == 0o600
++    link = tmp_path / "linked.db"
++    link.symlink_to(path)
++    with pytest.raises(ValueError):
++        private_file(link)
++
++
++def test_date_overflow_returns_invalid():
++    assert parse("999999999999999999999999-01-01") == (None, False)
++
++
++def test_workspace_order_is_parent_scoped():
++    manager.connect(":memory:")
++    try:
++        a, b = Workspace(description="A"), Workspace(description="B")
++        a.save()
++        b.save()
++        ca, cb = a.add_workspace(), b.add_workspace()
++        old_order = cb.order_index
++        ca.add_sibling()
++        manager.session.expire_all()
++        assert cb.order_index == old_order
++    finally:
++        manager.session.close()
++        manager.engine.dispose()
++
++
++def test_todo_order_is_parent_scoped():
++    manager.connect(":memory:")
++    try:
++        a, b = Workspace(description="A"), Workspace(description="B")
++        a.save()
++        b.save()
++        ta, tb = a.add_todo(), b.add_todo()
++        old_order = tb.order_index
++        ta.add_sibling()
++        manager.session.expire_all()
++        assert tb.order_index == old_order
++    finally:
++        manager.session.close()
++        manager.engine.dispose()
++
++
++def test_atomic_row_rollback():
++    manager.connect(":memory:")
++    try:
++        original = Workspace(description="keep")
++        original.save()
++        with pytest.raises(ValueError):
++            with manager.transaction():
++                original.drop()
++                Workspace(description="partial").save()
++                raise ValueError("malformed legacy record")
++        assert [w.description for w in Workspace.all()] == ["keep"]
++    finally:
++        manager.session.close()
++        manager.engine.dispose()

@@ -1,0 +1,12 @@
+{
+  "dependencies": {},
+  "devDependencies": {
+    "vitepress": "^1.4.1",
+    "vitepress-theme-tui": "^0.0.13"
+  },
+  "scripts": {
+    "docs:dev": "node -e \"console.error('Disabled: offline hardened edition does not start documentation servers');process.exit(1)\"",
+    "docs:build": "vitepress build docs",
+    "docs:preview": "node -e \"console.error('Disabled: offline hardened edition does not start documentation servers');process.exit(1)\""
+  }
+}
